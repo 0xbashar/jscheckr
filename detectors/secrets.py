@@ -69,19 +69,89 @@ class SecretDetector:
         
         return findings
     
-    def _is_false_positive(self, value: str, content: str, position: int) -> bool:
-        """Check if finding is likely a false positive"""
-        # Check value against false positive patterns
-        for fp_pattern in self.false_positive_patterns:
-            if re.search(fp_pattern, value, re.IGNORECASE):
-                return True
-        
-        # Check surrounding context (50 chars before)
-        start = max(0, position - 50)
-        context = content[start:position].lower()
-        
-        fp_context = ['example', 'test', 'sample', 'dummy', 'placeholder']
-        if any(word in context for word in fp_context):
-            return True
-        
-        return False
+    # Add these methods to the SecretDetector class:
+
+def _is_false_positive(self, value: str, content: str, position: int) -> bool:
+    """Enhanced false positive detection"""
+    
+    # Check if it's in a test file
+    if self._is_test_file(content):
+        return True
+    
+    # Check if it's a known placeholder or example
+    known_false_positives = [
+        'AKIAIOSFODNN7EXAMPLE',
+        'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        'your-api-key',
+        'your_api_key',
+        'YOUR_API_KEY',
+        'example',
+        'sample',
+        'test',
+        'dummy',
+        'xxxx',
+        '000000',
+        'abcdef',
+    ]
+    
+    value_lower = value.lower()
+    if any(fp in value_lower for fp in known_false_positives):
+        return True
+    
+    # Check surrounding context
+    context_start = max(0, position - 100)
+    context_end = min(len(content), position + len(value) + 100)
+    context = content[context_start:context_end].lower()
+    
+    # False positive indicators in context
+    fp_indicators = [
+        'example',
+        'documentation',
+        'placeholder',
+        'sample',
+        'template',
+        'boilerplate',
+        'xxxxx',
+        'todo',
+        'fixme',
+        'your-key',
+        'your_token',
+        'your_secret',
+    ]
+    
+    if any(indicator in context for indicator in fp_indicators):
+        return True
+    
+    # Check if it's in a comment
+    line_start = content.rfind('\n', 0, position) + 1
+    current_line = content[line_start:content.find('\n', position)]
+    
+    if current_line.strip().startswith(('//', '/*', '*', '#', '<!--')):
+        return True
+    
+    # Check if it's in a console.log or debug statement
+    if re.search(r'console\.(?:log|debug|warn|error|info)', current_line):
+        return True
+    
+    # Check if the value looks like a hash (hex characters only)
+    if re.match(r'^[0-9a-fA-F]{32,}$', value):
+        # This might be a hash, not a key
+        return True
+    
+    # Check if it's in a variable name (not a value)
+    if re.search(rf'(?:var|let|const|function)\s+\w*{re.escape(value)}\w*\s*=', current_line):
+        return True
+    
+    return False
+
+def _is_test_file(self, content: str) -> bool:
+    """Check if the file appears to be a test file"""
+    test_indicators = [
+        r'describe\(', r'it\(', r'test\(', r'expect\(', r'assert\.',
+        r'jest\.', r'mocha\.', r'chai\.', r'sinon\.',
+        r'\.spec\.', r'\.test\.', r'__tests__',
+    ]
+    
+    # Check first 1000 characters for test indicators
+    header = content[:1000]
+    return any(re.search(pattern, header) for pattern in test_indicators)
