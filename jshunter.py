@@ -45,6 +45,13 @@ class JSHunter:
             'sources': [],
             'sinks': []
         }
+        self.false_positive_config = {
+    'ignore_test_files': not args.include_tests,
+    'ignore_node_modules': not args.include_node_modules,
+    'min_confidence': args.min_confidence or 'LOW',
+    'ignore_safe_patterns': not args.aggressive,
+}
+
         self.logger = setup_logging(args.verbose)
         
     def banner(self):
@@ -288,6 +295,16 @@ class JSHunter:
         print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
 
 def main():
+    parser.add_argument('--include-tests', action='store_true',
+                   help='Include test files in analysis')
+parser.add_argument('--include-node-modules', action='store_true',
+                   help='Include node_modules in analysis')
+parser.add_argument('--min-confidence', choices=['HIGH', 'MEDIUM', 'LOW'],
+                   help='Minimum confidence level for reporting (default: LOW)')
+parser.add_argument('--aggressive', action='store_true',
+                   help='Aggressive mode - report all potential issues including likely false positives')
+parser.add_argument('--smart-filter', action='store_true', default=True,
+                   help='Enable smart filtering to reduce false positives (default: True)')
     parser = argparse.ArgumentParser(
         description='JSHunter - Advanced JavaScript Security Analysis Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
