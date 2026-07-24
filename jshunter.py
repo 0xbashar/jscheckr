@@ -46,12 +46,11 @@ class JSHunter:
             'sinks': []
         }
         self.false_positive_config = {
-    'ignore_test_files': not args.include_tests,
-    'ignore_node_modules': not args.include_node_modules,
-    'min_confidence': args.min_confidence or 'LOW',
-    'ignore_safe_patterns': not args.aggressive,
-}
-
+            'ignore_test_files': not args.include_tests if hasattr(args, 'include_tests') else True,
+            'ignore_node_modules': not args.include_node_modules if hasattr(args, 'include_node_modules') else True,
+            'min_confidence': args.min_confidence if hasattr(args, 'min_confidence') else 'LOW',
+            'ignore_safe_patterns': not args.aggressive if hasattr(args, 'aggressive') else True,
+        }
         self.logger = setup_logging(args.verbose)
         
     def banner(self):
@@ -98,6 +97,10 @@ class JSHunter:
             downloader = JSDownloader(self.args.output_dir)
             downloaded_files = await downloader.download_batch(self.js_files)
             
+            if not downloaded_files:
+                self.logger.warning(f"{Fore.YELLOW}[!] No files were downloaded successfully{Style.RESET_ALL}")
+                return
+            
             # Phase 3: Beautify JavaScript
             if not self.args.no_beautify:
                 self.logger.info(f"{Fore.BLUE}[*] Phase 3: Beautifying JavaScript{Style.RESET_ALL}")
@@ -139,31 +142,73 @@ class JSHunter:
             self.logger.warning(f"{Fore.YELLOW}[!] AST analyzer not found, skipping AST analysis{Style.RESET_ALL}")
             return
         
-        for js_file in js_files:
+        self.logger.info(f"{Fore.BLUE}[*] Running AST analysis on {len(js_files)} files...{Style.RESET_ALL}")
+        
+        for i, js_file in enumerate(js_files, 1):
             try:
+                self.logger.debug(f"Analyzing file {i}/{len(js_files)}: {js_file}")
+                
                 # Call Node.js AST analyzer
                 proc = await asyncio.create_subprocess_exec(
                     'node', str(analyzer_path), js_file,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await proc.communicate()
+                
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    self.logger.debug(f"AST analysis timeout for {js_file}")
+                    continue
                 
                 if proc.returncode == 0:
-                    results = json.loads(stdout)
-                    
-                    # Process DOM XSS findings
-                    if 'dom_xss' in results:
-                        self.analysis_results['dom_xss'].extend(results['dom_xss'])
-                    
-                    # Process taint analysis results
-                    if 'taint_flows' in results:
-                        for flow in results['taint_flows']:
-                            self.analysis_results['sources'].append(flow['source'])
-                            self.analysis_results['sinks'].append(flow['sink'])
+                    try:
+                        results = json.loads(stdout)
+                        
+                        # Process DOM XSS findings
+                        if 'dom_xss' in results:
+                            for finding in results['dom_xss']:
+                                finding['file'] = js_file
+                            self.analysis_results['dom_xss'].extend(results['dom_xss'])
+                        
+                        # Process taint analysis results
+                        if 'taint_flows' in results:
+                            for flow in results['taint_flows']:
+                                source_finding = {
+                                    'type': 'Taint Source',
+                                    'value': flow.get('source', 'unknown'),
+                                    'file': js_file,
+                                    'line': flow.get('line', 1),
+                                    'severity': 'HIGH',
+                                    'description': f"Tainted source: {flow.get('source', 'unknown')}"
+                                }
+                                sink_finding = {
+                                    'type': 'Taint Sink',
+                                    'value': flow.get('sink', 'unknown'),
+                                    'file': js_file,
+                                    'line': flow.get('line', 1),
+                                    'severity': 'HIGH',
+                                    'description': f"Tainted data reaches sink: {flow.get('sink', 'unknown')}"
+                                }
+                                self.analysis_results['sources'].append(source_finding)
+                                self.analysis_results['sinks'].append(sink_finding)
+                        
+                        # Process dangerous functions
+                        if 'dangerous_functions' in results:
+                            for func in results['dangerous_functions']:
+                                func['file'] = js_file
+                                self.analysis_results['sinks'].append(func)
+                                
+                    except json.JSONDecodeError:
+                        self.logger.debug(f"Invalid JSON output from AST analyzer for {js_file}")
                 else:
-                    self.logger.debug(f"AST analysis failed for {js_file}: {stderr.decode()}")
+                    error_msg = stderr.decode() if stderr else 'Unknown error'
+                    self.logger.debug(f"AST analysis failed for {js_file}: {error_msg}")
                     
+            except FileNotFoundError:
+                self.logger.error(f"{Fore.RED}[!] Node.js not found. Please install Node.js for AST analysis{Style.RESET_ALL}")
+                break
             except Exception as e:
                 self.logger.debug(f"Error analyzing {js_file}: {str(e)}")
     
@@ -176,10 +221,27 @@ class JSHunter:
         source_detector = SourceDetector()
         sink_detector = SinkDetector()
         
-        for js_file in js_files:
+        total_files = len(js_files)
+        
+        for i, js_file in enumerate(js_files, 1):
             try:
+                # Skip node_modules if configured
+                if self.false_positive_config['ignore_node_modules'] and 'node_modules' in js_file:
+                    continue
+                
+                # Skip test files if configured
+                if self.false_positive_config['ignore_test_files']:
+                    if any(pattern in js_file.lower() for pattern in ['.test.', '.spec.', '__tests__', 'test/']):
+                        continue
+                
+                self.logger.debug(f"Scanning file {i}/{total_files}: {js_file}")
+                
                 with open(js_file, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
+                
+                # Skip empty files
+                if not content.strip():
+                    continue
                 
                 # Detect secrets
                 secrets = secret_detector.detect(content, js_file)
@@ -215,10 +277,13 @@ class JSHunter:
         
         # HTML Report
         if 'html' in self.args.report_format or 'all' in self.args.report_format:
-            reporter = HTMLReporter()
-            html_path = os.path.join(self.args.output_dir, 'jshunter_report.html')
-            reporter.generate(self.analysis_results, html_path)
-            self.logger.info(f"{Fore.GREEN}[+] HTML report saved to {html_path}{Style.RESET_ALL}")
+            try:
+                reporter = HTMLReporter()
+                html_path = os.path.join(self.args.output_dir, 'jshunter_report.html')
+                reporter.generate(self.analysis_results, html_path)
+                self.logger.info(f"{Fore.GREEN}[+] HTML report saved to {html_path}{Style.RESET_ALL}")
+            except Exception as e:
+                self.logger.error(f"{Fore.RED}[!] Failed to generate HTML report: {str(e)}{Style.RESET_ALL}")
         
         # SARIF Report
         if 'sarif' in self.args.report_format or 'all' in self.args.report_format:
@@ -236,19 +301,39 @@ class JSHunter:
                     "driver": {
                         "name": "JSHunter",
                         "version": "1.0.0",
-                        "informationUri": "https://github.com/jshunter/jshunter"
+                        "informationUri": "https://github.com/jshunter/jshunter",
+                        "rules": []
                     }
                 },
                 "results": []
             }]
         }
         
+        # Track unique rules
+        rules_set = set()
+        
         # Add findings as SARIF results
         for category, findings in self.analysis_results.items():
             for finding in findings:
+                rule_id = f"JSHunter/{category}/{finding.get('type', 'unknown').replace(' ', '_')}"
+                
+                # Add rule if not already added
+                if rule_id not in rules_set:
+                    rules_set.add(rule_id)
+                    sarif['runs'][0]['tool']['driver']['rules'].append({
+                        "id": rule_id,
+                        "name": finding.get('type', 'Unknown'),
+                        "shortDescription": {
+                            "text": finding.get('description', f'{category} finding')
+                        },
+                        "defaultConfiguration": {
+                            "level": self._severity_to_sarif_level(finding.get('severity', 'warning'))
+                        }
+                    })
+                
                 result = {
-                    "ruleId": f"JSHunter/{category}",
-                    "level": "warning",
+                    "ruleId": rule_id,
+                    "level": self._severity_to_sarif_level(finding.get('severity', 'warning')),
                     "message": {
                         "text": finding.get('description', f'{category} finding')
                     },
@@ -269,6 +354,17 @@ class JSHunter:
         with open(output_path, 'w') as f:
             json.dump(sarif, f, indent=2)
     
+    def _severity_to_sarif_level(self, severity: str) -> str:
+        """Convert severity to SARIF level"""
+        severity_map = {
+            'CRITICAL': 'error',
+            'HIGH': 'error',
+            'MEDIUM': 'warning',
+            'LOW': 'note',
+            'INFO': 'note'
+        }
+        return severity_map.get(severity.upper(), 'warning')
+    
     def _display_summary(self):
         """Display analysis summary"""
         print(f"\n{Fore.CYAN}{'='*60}")
@@ -280,31 +376,51 @@ class JSHunter:
         total_endpoints = len(self.analysis_results['endpoints'])
         total_libraries = len(self.analysis_results['libraries'])
         total_dom_xss = len(self.analysis_results['dom_xss'])
+        total_sources = len(self.analysis_results['sources'])
+        total_sinks = len(self.analysis_results['sinks'])
         
         print(f"{Fore.GREEN}🔑 Secrets Found: {Fore.WHITE}{total_secrets}")
         print(f"{Fore.GREEN}🔗 Endpoints Found: {Fore.WHITE}{total_endpoints}")
         print(f"{Fore.GREEN}📚 Libraries Detected: {Fore.WHITE}{total_libraries}")
         print(f"{Fore.GREEN}⚠️  DOM XSS Risks: {Fore.WHITE}{total_dom_xss}")
+        print(f"{Fore.GREEN}📥 Sources Detected: {Fore.WHITE}{total_sources}")
+        print(f"{Fore.GREEN}📤 Sinks Detected: {Fore.WHITE}{total_sinks}")
         
+        # Show critical findings
         if total_secrets > 0:
-            print(f"\n{Fore.YELLOW}🔴 CRITICAL FINDINGS:")
+            print(f"\n{Fore.YELLOW}🔴 CRITICAL FINDINGS (Secrets):")
             for secret in self.analysis_results['secrets'][:5]:
                 print(f"  {Fore.RED}• {secret['type']}: {Fore.WHITE}{secret['value'][:50]}... "
-                      f"{Fore.CYAN}({secret['file']})")
+                      f"{Fore.CYAN}({os.path.basename(secret['file'])})")
+        
+        if total_dom_xss > 0:
+            print(f"\n{Fore.YELLOW}⚠️  DOM XSS VULNERABILITIES:")
+            for xss in self.analysis_results['dom_xss'][:5]:
+                print(f"  {Fore.RED}• {xss.get('severity', 'UNKNOWN')}: {Fore.WHITE}{xss.get('description', '')[:80]}... "
+                      f"{Fore.CYAN}({os.path.basename(xss['file'])}:{xss.get('line', '?')})")
+        
+        # Show library info
+        if total_libraries > 0:
+            print(f"\n{Fore.YELLOW}📚 DETECTED LIBRARIES:")
+            unique_libs = {}
+            for lib in self.analysis_results['libraries']:
+                lib_name = lib.get('library', 'Unknown')
+                lib_version = lib.get('version', 'unknown')
+                if lib_name not in unique_libs:
+                    unique_libs[lib_name] = lib_version
+            
+            for lib_name, lib_version in list(unique_libs.items())[:10]:
+                print(f"  {Fore.GREEN}• {lib_name} {Fore.WHITE}v{lib_version}")
         
         print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        
+        # Show output directory
+        print(f"\n{Fore.GREEN}📁 Reports saved to: {Fore.WHITE}{os.path.abspath(self.args.output_dir)}")
+        print(f"{Fore.CYAN}═{'='*59}═{Style.RESET_ALL}\n")
+
 
 def main():
-    parser.add_argument('--include-tests', action='store_true',
-                   help='Include test files in analysis')
-parser.add_argument('--include-node-modules', action='store_true',
-                   help='Include node_modules in analysis')
-parser.add_argument('--min-confidence', choices=['HIGH', 'MEDIUM', 'LOW'],
-                   help='Minimum confidence level for reporting (default: LOW)')
-parser.add_argument('--aggressive', action='store_true',
-                   help='Aggressive mode - report all potential issues including likely false positives')
-parser.add_argument('--smart-filter', action='store_true', default=True,
-                   help='Enable smart filtering to reduce false positives (default: True)')
+    """Main entry point"""
     parser = argparse.ArgumentParser(
         description='JSHunter - Advanced JavaScript Security Analysis Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -340,6 +456,18 @@ Examples:
     parser.add_argument('--source-maps', action='store_true',
                        help='Attempt to download and parse source maps')
     
+    # False positive control options
+    parser.add_argument('--include-tests', action='store_true',
+                       help='Include test files in analysis')
+    parser.add_argument('--include-node-modules', action='store_true',
+                       help='Include node_modules in analysis')
+    parser.add_argument('--min-confidence', choices=['HIGH', 'MEDIUM', 'LOW'],
+                       help='Minimum confidence level for reporting (default: LOW)')
+    parser.add_argument('--aggressive', action='store_true',
+                       help='Aggressive mode - report all potential issues including likely false positives')
+    parser.add_argument('--smart-filter', action='store_true', default=True,
+                       help='Enable smart filtering to reduce false positives (default: True)')
+    
     # Report options
     parser.add_argument('--report-format', nargs='+', 
                        default=['html'],
@@ -364,8 +492,12 @@ Examples:
     if args.url:
         urls = [args.url]
     elif args.file:
-        with open(args.file, 'r') as f:
-            urls = [line.strip() for line in f if line.strip()]
+        try:
+            with open(args.file, 'r') as f:
+                urls = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            print(f"{Fore.RED}[!] File not found: {args.file}{Style.RESET_ALL}")
+            sys.exit(1)
     
     # Validate URLs
     valid_urls = [url for url in urls if validate_url(url)]
@@ -373,12 +505,25 @@ Examples:
         print(f"{Fore.RED}[!] No valid URLs provided{Style.RESET_ALL}")
         sys.exit(1)
     
+    print(f"{Fore.CYAN}[*] Starting analysis for {len(valid_urls)} URL(s){Style.RESET_ALL}")
+    
     # Create and run JSHunter
     hunter = JSHunter(args)
     hunter.target_urls = valid_urls
     
     # Run async main
-    asyncio.run(hunter.run())
+    try:
+        asyncio.run(hunter.run())
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}[!] Analysis interrupted by user{Style.RESET_ALL}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"{Fore.RED}[!] Fatal error: {str(e)}{Style.RESET_ALL}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
