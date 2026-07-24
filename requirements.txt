@@ -1,0 +1,5 @@
+aiohttp>=3.8.0
+beautifulsoup4>=4.11.0
+colorama>=0.4.6
+jsbeautifier>=1.14.0
+playwright>=1.30.0
