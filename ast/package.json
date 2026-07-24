@@ -1,0 +1,15 @@
+{
+  "name": "jshunter-ast",
+  "version": "1.0.0",
+  "description": "AST analysis for JSHunter",
+  "main": "analyzer.js",
+  "scripts": {
+    "analyze": "node analyzer.js"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.23.0",
+    "@babel/traverse": "^7.23.0",
+    "@babel/types": "^7.23.0",
+    "eslint": "^8.0.0"
+  }
+}
